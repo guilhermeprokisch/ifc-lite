@@ -93,6 +93,8 @@ FROM debian:bookworm-slim AS runtime
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    curl \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
@@ -103,11 +105,18 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /app/target/release/ifc-lite-server /app/ifc-lite-server
 
-# Create cache directory with proper permissions
-RUN mkdir -p /app/cache && chown -R appuser:appuser /app
+# Create cache directory and runtime entrypoint
+RUN mkdir -p /app/cache /app/cache/tmp && chown -R appuser:appuser /app
+RUN cat <<'EOF' > /usr/local/bin/docker-entrypoint.sh
+#!/bin/sh
+set -eu
 
-# Switch to non-root user
-USER appuser
+mkdir -p /app/cache /app/cache/tmp
+chown -R appuser:appuser /app/cache
+
+exec gosu appuser "$@"
+EOF
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Environment defaults
 ENV RUST_LOG=info
@@ -125,4 +134,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/api/v1/health || exit 1
 
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["/app/ifc-lite-server"]

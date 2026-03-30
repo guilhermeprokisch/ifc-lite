@@ -229,23 +229,21 @@ fn process_batch(
 }
 
 /// Calculate dynamic batch size based on batch number and total job count.
-/// For large files, use MUCH larger batches to maximize parallel throughput and reduce overhead.
+/// Keep batches bounded so SSE/base64 payloads stay browser-friendly for very large files.
 fn calculate_batch_size(
     batch_number: usize, 
     initial_batch_size: usize, 
     max_batch_size: usize,
     total_jobs: usize,
 ) -> usize {
-    // For huge files (>50k jobs), use VERY aggressive batching to minimize batch count
+    // Respect the configured ceiling. For large files, ramp up smoothly toward it,
+    // but do not multiply it into giant batches that create oversized SSE events.
     let adjusted_max = if total_jobs > 50_000 {
-        // Very large files: 10k-20k entities per batch (minimize batch overhead)
-        (max_batch_size * 20).min(20_000)
+        max_batch_size.min(1_000)
     } else if total_jobs > 10_000 {
-        // Large files: 5k-10k entities per batch
-        (max_batch_size * 10).min(10_000)
+        max_batch_size.min(750)
     } else if total_jobs > 1_000 {
-        // Medium files: 2k-5k entities per batch
-        (max_batch_size * 5).min(5_000)
+        max_batch_size.min(500)
     } else {
         max_batch_size
     };

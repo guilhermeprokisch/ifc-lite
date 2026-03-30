@@ -1008,11 +1008,68 @@ pub async fn parse_parquet_by_url(
 
     let parquet_cache_key = format!("{}-parquet-v2", cache_key);
     let metadata_cache_key = format!("{}-parquet-metadata-v2", cache_key);
+    let data_model_cache_key = format!("{}-datamodel-v2", cache_key);
 
     if let (Some(cached_parquet), Some(cached_metadata_json)) = (
         state.cache.get_bytes(&parquet_cache_key).await?,
         state.cache.get_bytes(&metadata_cache_key).await?,
     ) {
+        let has_data_model_cache = state.cache.get_bytes(&data_model_cache_key).await?.is_some();
+        if !has_data_model_cache {
+            tracing::warn!(
+                cache_key = %cache_key,
+                parquet_cache_key = %parquet_cache_key,
+                metadata_cache_key = %metadata_cache_key,
+                data_model_cache_key = %data_model_cache_key,
+                source_url = %remote.url,
+                "Parquet URL cache HIT without data model cache; scheduling backfill"
+            );
+            let cache = state.cache.clone();
+            let data_model_cache_key = data_model_cache_key.clone();
+            let cache_key_for_log = cache_key.clone();
+            let content_for_cache = String::from_utf8(data.clone())?;
+            tokio::spawn(async move {
+                let data_model_result = tokio::task::spawn_blocking(move || {
+                    extract_data_model(&content_for_cache)
+                })
+                .await;
+
+                match data_model_result {
+                    Ok(data_model) => {
+                        let serialize_result = tokio::task::spawn_blocking(move || {
+                            serialize_data_model_to_parquet(&data_model)
+                        })
+                        .await;
+
+                        match serialize_result {
+                            Ok(Ok(parquet_data)) => {
+                        if let Err(e) = cache.set_bytes(&data_model_cache_key, &parquet_data).await {
+                            tracing::error!(error = %e, cache_key = %cache_key_for_log, "Failed to backfill data model cache for remote parse cache hit");
+                        } else {
+                            tracing::info!(cache_key = %cache_key_for_log, size = parquet_data.len(), "Backfilled data model cache for remote parse cache hit");
+                        }
+                    }
+                            Ok(Err(e)) => {
+                                tracing::error!(error = %e, cache_key = %cache_key_for_log, "Failed to serialize data model for remote parse cache hit");
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, cache_key = %cache_key_for_log, "Data model serialization task failed for remote parse cache hit");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, cache_key = %cache_key_for_log, "Data model extraction task failed for remote parse cache hit");
+                    }
+                }
+            });
+        } else {
+            tracing::info!(
+                cache_key = %cache_key,
+                data_model_cache_key = %data_model_cache_key,
+                "Parquet URL cache HIT with data model cache already available"
+            );
+        }
+
         tracing::info!(
             cache_key = %cache_key,
             parquet_size = cached_parquet.len(),
