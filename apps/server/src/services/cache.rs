@@ -19,6 +19,7 @@ impl DiskCache {
     /// Create a new cache in the specified directory.
     pub async fn new(cache_dir: &str) -> Self {
         let path = PathBuf::from(cache_dir);
+        let tmp_path = path.join("tmp");
 
         // Create cache directory if it doesn't exist
         if let Err(e) = tokio::fs::create_dir_all(&path).await {
@@ -26,6 +27,15 @@ impl DiskCache {
                 error = %e,
                 path = %path.display(),
                 "Failed to create cache directory"
+            );
+        }
+
+        // cacache writes via temporary files under <cache>/tmp before committing.
+        if let Err(e) = tokio::fs::create_dir_all(&tmp_path).await {
+            tracing::warn!(
+                error = %e,
+                path = %tmp_path.display(),
+                "Failed to create cache temp directory"
             );
         }
 

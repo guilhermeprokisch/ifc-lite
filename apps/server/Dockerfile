@@ -2,12 +2,42 @@
 # Optimized multi-stage build for Railway deployment
 
 # Stage 1: Chef - prepare recipe for dependency caching
-FROM lukemathwalker/cargo-chef:latest-rust-1.88 AS chef
+FROM rust:1.88 AS chef
+RUN cargo install cargo-chef
 WORKDIR /app
 
 # Stage 2: Planner - create dependency recipe
 FROM chef AS planner
 COPY . .
+RUN cat <<'EOF' > Cargo.toml
+[workspace]
+members = ["rust/core", "rust/geometry", "rust/processing", "apps/server"]
+resolver = "2"
+
+[workspace.package]
+version = "2.1.5"
+edition = "2021"
+authors = ["IFC-Lite Contributors"]
+license = "MPL-2.0"
+repository = "https://github.com/louistrue/ifc-lite"
+
+[workspace.dependencies]
+ifc-lite-core = { version = "2.1.5", path = "rust/core" }
+ifc-lite-geometry = { version = "2.1.5", path = "rust/geometry" }
+ifc-lite-wasm = { version = "2.1.5", path = "rust/wasm-bindings" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = 'abort'
+overflow-checks = false
+
+[profile.release.package."*"]
+opt-level = 3
+strip = true
+EOF
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 3: Builder - build dependencies (cached) then app
@@ -17,6 +47,7 @@ FROM chef AS builder
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    patchelf \
     && rm -rf /var/lib/apt/lists/*
 
 # Build dependencies first (cached layer)
@@ -25,6 +56,35 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 # Copy source and build application
 COPY . .
+RUN cat <<'EOF' > Cargo.toml
+[workspace]
+members = ["rust/core", "rust/geometry", "rust/processing", "apps/server"]
+resolver = "2"
+
+[workspace.package]
+version = "2.1.5"
+edition = "2021"
+authors = ["IFC-Lite Contributors"]
+license = "MPL-2.0"
+repository = "https://github.com/louistrue/ifc-lite"
+
+[workspace.dependencies]
+ifc-lite-core = { version = "2.1.5", path = "rust/core" }
+ifc-lite-geometry = { version = "2.1.5", path = "rust/geometry" }
+ifc-lite-wasm = { version = "2.1.5", path = "rust/wasm-bindings" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = 'abort'
+overflow-checks = false
+
+[profile.release.package."*"]
+opt-level = 3
+strip = true
+EOF
 RUN cargo build --release --package ifc-lite-server
 
 # Stage 4: Runtime - minimal image
@@ -33,6 +93,8 @@ FROM debian:bookworm-slim AS runtime
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    curl \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
@@ -43,11 +105,18 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /app/target/release/ifc-lite-server /app/ifc-lite-server
 
-# Create cache directory with proper permissions
-RUN mkdir -p /app/cache && chown -R appuser:appuser /app
+# Create cache directory and runtime entrypoint
+RUN mkdir -p /app/cache /app/cache/tmp && chown -R appuser:appuser /app
+RUN cat <<'EOF' > /usr/local/bin/docker-entrypoint.sh
+#!/bin/sh
+set -eu
 
-# Switch to non-root user
-USER appuser
+mkdir -p /app/cache /app/cache/tmp
+chown -R appuser:appuser /app/cache
+
+exec gosu appuser "$@"
+EOF
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Environment defaults
 ENV RUST_LOG=info
@@ -65,4 +134,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/api/v1/health || exit 1
 
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["/app/ifc-lite-server"]

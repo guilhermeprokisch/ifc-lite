@@ -14,6 +14,7 @@ use arrow::array::{Float32Array, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -269,6 +270,280 @@ pub fn serialize_to_parquet(meshes: &[MeshData]) -> Result<Bytes, ParquetError> 
     output.extend_from_slice(&index_parquet);
 
     Ok(Bytes::from(output))
+}
+
+/// Deserialize mesh data from the custom multi-section Parquet geometry format.
+///
+/// This is primarily used by streaming cache-hit paths that need to re-batch
+/// previously cached geometry instead of sending the entire cached payload as one
+/// monolithic SSE event.
+pub fn deserialize_from_parquet(data: &[u8]) -> Result<Vec<MeshData>, ParquetError> {
+    let mut offset = 0usize;
+
+    let mesh_section = read_section(data, &mut offset)?;
+    let vertex_section = read_section(data, &mut offset)?;
+    let index_section = read_section(data, &mut offset)?;
+
+    let mesh_batches = read_record_batches(mesh_section)?;
+    let vertex_batches = read_record_batches(vertex_section)?;
+    let index_batches = read_record_batches(index_section)?;
+
+    let mut express_ids = Vec::new();
+    let mut ifc_types = Vec::new();
+    let mut vertex_starts = Vec::new();
+    let mut vertex_counts = Vec::new();
+    let mut index_starts = Vec::new();
+    let mut index_counts = Vec::new();
+    let mut color_r = Vec::new();
+    let mut color_g = Vec::new();
+    let mut color_b = Vec::new();
+    let mut color_a = Vec::new();
+
+    for batch in &mesh_batches {
+        let express_id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| invalid_data("mesh express_id column had unexpected type"))?;
+        let ifc_type_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| invalid_data("mesh ifc_type column had unexpected type"))?;
+        let vertex_start_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| invalid_data("mesh vertex_start column had unexpected type"))?;
+        let vertex_count_col = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| invalid_data("mesh vertex_count column had unexpected type"))?;
+        let index_start_col = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| invalid_data("mesh index_start column had unexpected type"))?;
+        let index_count_col = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| invalid_data("mesh index_count column had unexpected type"))?;
+        let color_r_col = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| invalid_data("mesh color_r column had unexpected type"))?;
+        let color_g_col = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| invalid_data("mesh color_g column had unexpected type"))?;
+        let color_b_col = batch
+            .column(8)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| invalid_data("mesh color_b column had unexpected type"))?;
+        let color_a_col = batch
+            .column(9)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| invalid_data("mesh color_a column had unexpected type"))?;
+
+        for row in 0..batch.num_rows() {
+            express_ids.push(express_id_col.value(row));
+            ifc_types.push(ifc_type_col.value(row).to_string());
+            vertex_starts.push(vertex_start_col.value(row) as usize);
+            vertex_counts.push(vertex_count_col.value(row) as usize);
+            index_starts.push(index_start_col.value(row) as usize);
+            index_counts.push(index_count_col.value(row) as usize);
+            color_r.push(color_r_col.value(row));
+            color_g.push(color_g_col.value(row));
+            color_b.push(color_b_col.value(row));
+            color_a.push(color_a_col.value(row));
+        }
+    }
+
+    let mut pos_x = Vec::new();
+    let mut pos_y = Vec::new();
+    let mut pos_z = Vec::new();
+    let mut norm_x = Vec::new();
+    let mut norm_y = Vec::new();
+    let mut norm_z = Vec::new();
+
+    for batch in &vertex_batches {
+        let x_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| invalid_data("vertex x column had unexpected type"))?;
+        let y_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| invalid_data("vertex y column had unexpected type"))?;
+        let z_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| invalid_data("vertex z column had unexpected type"))?;
+        let nx_col = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| invalid_data("vertex nx column had unexpected type"))?;
+        let ny_col = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| invalid_data("vertex ny column had unexpected type"))?;
+        let nz_col = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| invalid_data("vertex nz column had unexpected type"))?;
+
+        for row in 0..batch.num_rows() {
+            pos_x.push(x_col.value(row));
+            pos_y.push(y_col.value(row));
+            pos_z.push(z_col.value(row));
+            norm_x.push(nx_col.value(row));
+            norm_y.push(ny_col.value(row));
+            norm_z.push(nz_col.value(row));
+        }
+    }
+
+    let mut idx_0 = Vec::new();
+    let mut idx_1 = Vec::new();
+    let mut idx_2 = Vec::new();
+
+    for batch in &index_batches {
+        let i0_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| invalid_data("index i0 column had unexpected type"))?;
+        let i1_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| invalid_data("index i1 column had unexpected type"))?;
+        let i2_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| invalid_data("index i2 column had unexpected type"))?;
+
+        for row in 0..batch.num_rows() {
+            idx_0.push(i0_col.value(row));
+            idx_1.push(i1_col.value(row));
+            idx_2.push(i2_col.value(row));
+        }
+    }
+
+    let mesh_count = express_ids.len();
+    let mut meshes = Vec::with_capacity(mesh_count);
+
+    for row in 0..mesh_count {
+        let vertex_start = vertex_starts[row];
+        let vertex_end = vertex_start + vertex_counts[row];
+        let index_start = index_starts[row] / 3;
+        let index_end = index_start + (index_counts[row] / 3);
+
+        if vertex_end > pos_x.len()
+            || vertex_end > pos_y.len()
+            || vertex_end > pos_z.len()
+            || vertex_end > norm_x.len()
+            || vertex_end > norm_y.len()
+            || vertex_end > norm_z.len()
+            || index_end > idx_0.len()
+            || index_end > idx_1.len()
+            || index_end > idx_2.len()
+        {
+            tracing::error!(
+                row,
+                express_id = express_ids[row],
+                vertex_start,
+                vertex_end,
+                vertex_count = vertex_counts[row],
+                index_start,
+                index_end,
+                index_count = index_counts[row],
+                pos_len = pos_x.len(),
+                norm_len = norm_x.len(),
+                tri_len = idx_0.len(),
+                "Decoded parquet mesh offsets exceeded bounds"
+            );
+            return Err(invalid_data("mesh offsets exceeded decoded parquet bounds").into());
+        }
+
+        let mut positions = Vec::with_capacity(vertex_counts[row] * 3);
+        let mut normals = Vec::with_capacity(vertex_counts[row] * 3);
+        let mut indices = Vec::with_capacity(index_counts[row]);
+
+        // Invert the server-side Z-up -> Y-up transform so re-serialization
+        // through `serialize_to_parquet` produces the same on-the-wire data shape.
+        for vertex_idx in vertex_start..vertex_end {
+            positions.push(pos_x[vertex_idx]);
+            positions.push(-pos_z[vertex_idx]);
+            positions.push(pos_y[vertex_idx]);
+
+            normals.push(norm_x[vertex_idx]);
+            normals.push(-norm_z[vertex_idx]);
+            normals.push(norm_y[vertex_idx]);
+        }
+
+        for index_idx in index_start..index_end {
+            indices.push(idx_0[index_idx]);
+            indices.push(idx_1[index_idx]);
+            indices.push(idx_2[index_idx]);
+        }
+
+        meshes.push(MeshData::new(
+            express_ids[row],
+            ifc_types[row].clone(),
+            positions,
+            normals,
+            indices,
+            [color_r[row], color_g[row], color_b[row], color_a[row]],
+        ));
+    }
+
+    Ok(meshes)
+}
+
+fn read_section<'a>(data: &'a [u8], offset: &mut usize) -> Result<&'a [u8], std::io::Error> {
+    if data.len().saturating_sub(*offset) < 4 {
+        return Err(invalid_data("missing parquet section length"));
+    }
+
+    let len = u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap()) as usize;
+    *offset += 4;
+
+    if data.len().saturating_sub(*offset) < len {
+        return Err(invalid_data("parquet section length exceeded payload bounds"));
+    }
+
+    let section = &data[*offset..*offset + len];
+    *offset += len;
+    Ok(section)
+}
+
+fn read_record_batches(data: &[u8]) -> Result<Vec<RecordBatch>, ParquetError> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(data))?;
+    let reader = builder.build()?;
+    let mut batches = Vec::new();
+
+    for batch in reader {
+        batches.push(batch?);
+    }
+
+    Ok(batches)
+}
+
+fn invalid_data(message: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
 /// Write a RecordBatch to a Parquet buffer with LZ4 compression.
