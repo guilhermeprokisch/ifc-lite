@@ -6,7 +6,7 @@
 
 use crate::error::ApiError;
 use crate::services::{
-    cache::DiskCache, extract_data_model, process_geometry_filtered,
+    cache::DiskCache, deserialize_from_parquet, extract_data_model, process_geometry_filtered,
     process_streaming, serialize_data_model_to_parquet, serialize_to_parquet,
     serialize_to_parquet_optimized_with_stats, OpeningFilterMode, OptimizedStats, VERTEX_MULTIPLIER,
 };
@@ -26,6 +26,130 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io::Read;
+
+fn build_cached_parquet_stream(
+    cache_key: &str,
+    metadata_header: ParquetMetadataHeader,
+    geometry_data: &[u8],
+    batch_size: usize,
+) -> Result<Sse<std::pin::Pin<Box<dyn futures::Stream<Item = Result<Event, Infallible>> + Send>>>, ApiError> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    let meshes = match deserialize_from_parquet(geometry_data) {
+        Ok(meshes) => meshes,
+        Err(error) => {
+            tracing::warn!(
+                cache_key = %cache_key,
+                error = %error,
+                geometry_size = geometry_data.len(),
+                "Failed to deserialize cached geometry for re-batching; falling back to single cached batch"
+            );
+
+            let fallback_stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Event, Infallible>> + Send>> =
+                Box::pin(futures::stream::iter(vec![
+                    Ok::<_, Infallible>(Event::default().data(
+                        serde_json::to_string(&ParquetStreamEvent::Start {
+                            total_estimate: metadata_header.stats.total_meshes,
+                            cache_key: cache_key.to_string(),
+                        })
+                        .unwrap(),
+                    )),
+                    Ok(Event::default().data(
+                        serde_json::to_string(&ParquetStreamEvent::Batch {
+                            data: STANDARD.encode(geometry_data),
+                            mesh_count: metadata_header.stats.total_meshes,
+                            batch_number: 1,
+                        })
+                        .unwrap(),
+                    )),
+                    Ok(Event::default().data(
+                        serde_json::to_string(&ParquetStreamEvent::Complete {
+                            stats: metadata_header.stats,
+                            metadata: metadata_header.metadata,
+                        })
+                        .unwrap(),
+                    )),
+                ]));
+
+            return Ok(Sse::new(fallback_stream).keep_alive(KeepAlive::default()));
+        }
+    };
+
+    let mut events = Vec::new();
+    events.push(Ok::<_, Infallible>(Event::default().data(
+        serde_json::to_string(&ParquetStreamEvent::Start {
+            total_estimate: metadata_header.stats.total_meshes,
+            cache_key: cache_key.to_string(),
+        })
+        .unwrap(),
+    )));
+
+    let effective_batch_size = batch_size.max(1);
+    for (batch_index, batch_meshes) in meshes.chunks(effective_batch_size).enumerate() {
+        let parquet_bytes = serialize_to_parquet(batch_meshes)
+            .map_err(|e| ApiError::Internal(format!("Failed to serialize cached geometry batch: {}", e)))?;
+        events.push(Ok(Event::default().data(
+            serde_json::to_string(&ParquetStreamEvent::Batch {
+                data: STANDARD.encode(&parquet_bytes),
+                mesh_count: batch_meshes.len(),
+                batch_number: batch_index + 1,
+            })
+            .unwrap(),
+        )));
+    }
+
+    events.push(Ok(Event::default().data(
+        serde_json::to_string(&ParquetStreamEvent::Complete {
+            stats: metadata_header.stats,
+            metadata: metadata_header.metadata,
+        })
+        .unwrap(),
+    )));
+
+    let stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Event, Infallible>> + Send>> =
+        Box::pin(futures::stream::iter(events));
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+fn schedule_data_model_backfill(
+    cache: std::sync::Arc<crate::services::cache::DiskCache>,
+    cache_key: String,
+    data_model_cache_key: String,
+    content: String,
+    context: &'static str,
+) {
+    tokio::spawn(async move {
+        let data_model_result = tokio::task::spawn_blocking(move || extract_data_model(&content)).await;
+
+        match data_model_result {
+            Ok(data_model) => {
+                let serialize_result = tokio::task::spawn_blocking(move || {
+                    serialize_data_model_to_parquet(&data_model)
+                })
+                .await;
+
+                match serialize_result {
+                    Ok(Ok(parquet_data)) => {
+                        if let Err(e) = cache.set_bytes(&data_model_cache_key, &parquet_data).await {
+                            tracing::error!(error = %e, cache_key = %cache_key, context, "Failed to backfill data model cache");
+                        } else {
+                            tracing::info!(cache_key = %cache_key, size = parquet_data.len(), context, "Backfilled data model cache");
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, cache_key = %cache_key, context, "Failed to serialize backfilled data model");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, cache_key = %cache_key, context, "Backfill data model serialization task failed");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, cache_key = %cache_key, context, "Backfill data model extraction task failed");
+            }
+        }
+    });
+}
 
 /// Query parameters shared by all parse endpoints.
 #[derive(serde::Deserialize, Default)]
@@ -256,11 +380,37 @@ pub async fn parse_parquet_stream_by_url(
 
     let parquet_cache_key = format!("{}-parquet-v2", cache_key);
     let metadata_cache_key = format!("{}-parquet-metadata-v2", cache_key);
+    let data_model_cache_key = format!("{}-datamodel-v2", cache_key);
 
     if let (Some(cached_parquet), Some(cached_metadata_json)) = (
         state.cache.get_bytes(&parquet_cache_key).await?,
         state.cache.get_bytes(&metadata_cache_key).await?,
     ) {
+        let has_data_model_cache = state.cache.get_bytes(&data_model_cache_key).await?.is_some();
+        if !has_data_model_cache {
+            tracing::warn!(
+                cache_key = %cache_key,
+                parquet_cache_key = %parquet_cache_key,
+                metadata_cache_key = %metadata_cache_key,
+                data_model_cache_key = %data_model_cache_key,
+                source_url = %remote.url,
+                "Streaming URL cache HIT without data model cache; scheduling backfill"
+            );
+            schedule_data_model_backfill(
+                state.cache.clone(),
+                cache_key.clone(),
+                data_model_cache_key.clone(),
+                String::from_utf8(data.clone())?,
+                "streaming remote parse cache hit",
+            );
+        } else {
+            tracing::info!(
+                cache_key = %cache_key,
+                data_model_cache_key = %data_model_cache_key,
+                "Streaming URL cache HIT with data model cache already available"
+            );
+        }
+
         tracing::info!(
             cache_key = %cache_key,
             parquet_size = cached_parquet.len(),
@@ -271,32 +421,22 @@ pub async fn parse_parquet_stream_by_url(
             .map_err(|e| ApiError::Internal(format!("Failed to parse cached metadata: {}", e)))?;
 
         let geometry_len = u32::from_le_bytes(cached_parquet[0..4].try_into().unwrap()) as usize;
-        let geometry_data = cached_parquet[4..4 + geometry_len].to_vec();
+        let geometry_data = &cached_parquet[4..4 + geometry_len];
+        let cache_hit_batch_size = state.config.max_batch_size.min(1000).max(1);
 
-        let cache_key_for_stream = cache_key.clone();
-        let fast_stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Event, Infallible>> + Send>> = Box::pin(futures::stream::iter(vec![
-            Ok::<_, Infallible>(Event::default().data(
-                serde_json::to_string(&ParquetStreamEvent::Start {
-                    total_estimate: metadata_header.stats.total_meshes,
-                    cache_key: cache_key_for_stream.clone(),
-                }).unwrap()
-            )),
-            Ok(Event::default().data(
-                serde_json::to_string(&ParquetStreamEvent::Batch {
-                    data: base64::engine::general_purpose::STANDARD.encode(&geometry_data),
-                    mesh_count: metadata_header.stats.total_meshes,
-                    batch_number: 1,
-                }).unwrap()
-            )),
-            Ok(Event::default().data(
-                serde_json::to_string(&ParquetStreamEvent::Complete {
-                    stats: metadata_header.stats,
-                    metadata: metadata_header.metadata,
-                }).unwrap()
-            )),
-        ]));
+        tracing::info!(
+            cache_key = %cache_key,
+            mesh_count = metadata_header.stats.total_meshes,
+            batch_size = cache_hit_batch_size,
+            "Streaming URL cache HIT - re-batching cached geometry for SSE"
+        );
 
-        return Ok(Sse::new(fast_stream).keep_alive(KeepAlive::default()));
+        return build_cached_parquet_stream(
+            &cache_key,
+            metadata_header,
+            geometry_data,
+            cache_hit_batch_size,
+        );
     }
 
     tracing::info!(
@@ -429,6 +569,76 @@ pub async fn parse_parquet_stream_by_url(
         },
     ));
 
+    let content_for_cache = content.clone();
+    let cache_key_for_dm = cache_key.clone();
+    let cache_for_dm = cache.clone();
+    tokio::spawn(async move {
+        tracing::info!(
+            cache_key = %cache_key_for_dm,
+            "Starting background data model extraction for URL stream"
+        );
+
+        let dm_result = tokio::task::spawn_blocking(move || {
+            extract_data_model(&content_for_cache)
+        }).await;
+
+        match dm_result {
+            Ok(data_model) => {
+                tracing::info!(
+                    cache_key = %cache_key_for_dm,
+                    entity_count = data_model.entities.len(),
+                    property_set_count = data_model.property_sets.len(),
+                    relationship_count = data_model.relationships.len(),
+                    "Background data model extraction complete for URL stream"
+                );
+
+                let serialize_result = tokio::task::spawn_blocking(move || {
+                    serialize_data_model_to_parquet(&data_model)
+                }).await;
+
+                match serialize_result {
+                    Ok(Ok(parquet_data)) => {
+                        let dm_key = format!("{}-datamodel-v2", cache_key_for_dm);
+                        if let Err(e) = cache_for_dm.set_bytes(&dm_key, &parquet_data).await {
+                            tracing::error!(
+                                error = %e,
+                                cache_key = %dm_key,
+                                "Failed to cache data model from URL stream"
+                            );
+                        } else {
+                            tracing::info!(
+                                cache_key = %dm_key,
+                                size = parquet_data.len(),
+                                "Data model cached from URL stream"
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(
+                            error = %e,
+                            cache_key = %cache_key_for_dm,
+                            "Failed to serialize data model from URL stream"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            cache_key = %cache_key_for_dm,
+                            "Background data model serialization task failed for URL stream"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    cache_key = %cache_key_for_dm,
+                    "Background data model extraction task failed for URL stream"
+                );
+            }
+        }
+    });
+
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
@@ -510,11 +720,36 @@ pub async fn parse_parquet_stream(
     // This avoids re-processing files that are already cached
     let parquet_cache_key = format!("{}-parquet-v2", cache_key);
     let metadata_cache_key = format!("{}-parquet-metadata-v2", cache_key);
+    let data_model_cache_key = format!("{}-datamodel-v2", cache_key);
 
     if let (Some(cached_parquet), Some(cached_metadata_json)) = (
         state.cache.get_bytes(&parquet_cache_key).await?,
         state.cache.get_bytes(&metadata_cache_key).await?,
     ) {
+        let has_data_model_cache = state.cache.get_bytes(&data_model_cache_key).await?.is_some();
+        if !has_data_model_cache {
+            tracing::warn!(
+                cache_key = %cache_key,
+                parquet_cache_key = %parquet_cache_key,
+                metadata_cache_key = %metadata_cache_key,
+                data_model_cache_key = %data_model_cache_key,
+                "Streaming cache HIT without data model cache; scheduling backfill"
+            );
+            schedule_data_model_backfill(
+                state.cache.clone(),
+                cache_key.clone(),
+                data_model_cache_key.clone(),
+                String::from_utf8(data.clone())?,
+                "streaming multipart parse cache hit",
+            );
+        } else {
+            tracing::info!(
+                cache_key = %cache_key,
+                data_model_cache_key = %data_model_cache_key,
+                "Streaming cache HIT with data model cache already available"
+            );
+        }
+
         tracing::info!(
             cache_key = %cache_key,
             parquet_size = cached_parquet.len(),
@@ -525,38 +760,23 @@ pub async fn parse_parquet_stream(
         let metadata_header: ParquetMetadataHeader = serde_json::from_slice(&cached_metadata_json)
             .map_err(|e| ApiError::Internal(format!("Failed to parse cached metadata: {}", e)))?;
 
-        // Extract geometry length from combined parquet (first 4 bytes)
         let geometry_len = u32::from_le_bytes(cached_parquet[0..4].try_into().unwrap()) as usize;
-        let geometry_data = cached_parquet[4..4 + geometry_len].to_vec();
+        let geometry_data = &cached_parquet[4..4 + geometry_len];
+        let cache_hit_batch_size = state.config.max_batch_size.min(1000).max(1);
 
-        // Create fast stream with cached data
-        let cache_key_for_stream = cache_key.clone();
-        let fast_stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Event, Infallible>> + Send>> = Box::pin(futures::stream::iter(vec![
-            // Start event
-            Ok::<_, Infallible>(Event::default().data(
-                serde_json::to_string(&ParquetStreamEvent::Start {
-                    total_estimate: metadata_header.stats.total_meshes,
-                    cache_key: cache_key_for_stream.clone(),
-                }).unwrap()
-            )),
-            // Single batch with all cached geometry
-            Ok(Event::default().data(
-                serde_json::to_string(&ParquetStreamEvent::Batch {
-                    data: base64::engine::general_purpose::STANDARD.encode(&geometry_data),
-                    mesh_count: metadata_header.stats.total_meshes,
-                    batch_number: 1,
-                }).unwrap()
-            )),
-            // Complete event
-            Ok(Event::default().data(
-                serde_json::to_string(&ParquetStreamEvent::Complete {
-                    stats: metadata_header.stats,
-                    metadata: metadata_header.metadata,
-                }).unwrap()
-            )),
-        ]));
+        tracing::info!(
+            cache_key = %cache_key,
+            mesh_count = metadata_header.stats.total_meshes,
+            batch_size = cache_hit_batch_size,
+            "Streaming cache HIT - re-batching cached geometry for SSE"
+        );
 
-        return Ok(Sse::new(fast_stream).keep_alive(KeepAlive::default()));
+        return build_cached_parquet_stream(
+            &cache_key,
+            metadata_header,
+            geometry_data,
+            cache_hit_batch_size,
+        );
     }
 
     tracing::info!(
@@ -715,24 +935,45 @@ pub async fn parse_parquet_stream(
     let cache_key_for_dm = cache_key.clone();
     let cache_for_dm = cache.clone();
     tokio::spawn(async move {
+        tracing::info!(cache_key = %cache_key_for_dm, "Starting background data model extraction for stream");
         // Run data model extraction in blocking task
         let dm_result = tokio::task::spawn_blocking(move || {
             extract_data_model(&content_for_cache)
         }).await;
 
-        if let Ok(data_model) = dm_result {
-            // Serialize and cache
-            let serialize_result = tokio::task::spawn_blocking(move || {
-                serialize_data_model_to_parquet(&data_model)
-            }).await;
+        match dm_result {
+            Ok(data_model) => {
+                tracing::info!(
+                    cache_key = %cache_key_for_dm,
+                    entity_count = data_model.entities.len(),
+                    property_set_count = data_model.property_sets.len(),
+                    relationship_count = data_model.relationships.len(),
+                    "Background data model extraction complete for stream"
+                );
 
-            if let Ok(Ok(parquet_data)) = serialize_result {
-                let dm_key = format!("{}-datamodel-v2", cache_key_for_dm);
-                if let Err(e) = cache_for_dm.set_bytes(&dm_key, &parquet_data).await {
-                    tracing::error!(error = %e, "Failed to cache data model from stream");
-                } else {
-                    tracing::info!(cache_key = %dm_key, size = parquet_data.len(), "Data model cached from stream");
+                let serialize_result = tokio::task::spawn_blocking(move || {
+                    serialize_data_model_to_parquet(&data_model)
+                }).await;
+
+                match serialize_result {
+                    Ok(Ok(parquet_data)) => {
+                        let dm_key = format!("{}-datamodel-v2", cache_key_for_dm);
+                        if let Err(e) = cache_for_dm.set_bytes(&dm_key, &parquet_data).await {
+                            tracing::error!(error = %e, cache_key = %dm_key, "Failed to cache data model from stream");
+                        } else {
+                            tracing::info!(cache_key = %dm_key, size = parquet_data.len(), "Data model cached from stream");
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, cache_key = %cache_key_for_dm, "Failed to serialize data model from stream");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, cache_key = %cache_key_for_dm, "Background data model serialization task failed for stream");
+                    }
                 }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, cache_key = %cache_key_for_dm, "Background data model extraction task failed for stream");
             }
         }
     });
